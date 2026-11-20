@@ -1766,3 +1766,148 @@ async def test_digraph_group_chat_resume_with_termination_condition(runtime: Age
     assert agent_a.total_messages == 1  # Still only ran once
     assert agent_b.total_messages == 1  # Still only ran once
     assert agent_c.total_messages == 1  # Now ran once
+
+
+@pytest.mark.asyncio
+async def test_digraph_group_chat_recovers_interrupted_single_parent_transition(
+    runtime: AgentRuntime | None,
+) -> None:
+    """Resume a checkpoint saved after an actual predecessor transition error."""
+    agent_a = _EchoAgent("A", description="Echo agent A")
+    agent_b = _EchoAgent("B", description="Echo agent B")
+    graph = DiGraph(
+        nodes={
+            "A": DiGraphNode(name="A", edges=[DiGraphEdge(target="B")]),
+            "B": DiGraphNode(name="B", edges=[]),
+        }
+    )
+    team = GraphFlow(
+        participants=[agent_a, agent_b],
+        graph=graph,
+        runtime=runtime,
+        termination_condition=MaxMessageTermination(2),
+    )
+
+    # Fail inside the actual transition after A's response enters history.
+    # Save the resulting checkpoint without manually changing manager state.
+    with patch.object(DiGraphEdge, "check_condition", side_effect=RuntimeError("transition interrupted")):
+        with pytest.raises(RuntimeError, match="transition interrupted"):
+            await asyncio.wait_for(team.run(task="Continue"), timeout=2.0)
+    state = dict(await team.save_state())
+    manager_state = state["agent_states"]["GraphManager"]
+    assert manager_state["message_thread"][-1]["source"] == "A"
+    assert manager_state["ready"] == []
+    activation_group = graph.nodes["A"].edges[0].activation_group
+    assert manager_state["remaining"]["B"][activation_group] == 1
+
+    resumed = GraphFlow(participants=[agent_a, agent_b], graph=graph, runtime=runtime)
+    await resumed.load_state(state)
+    result = await asyncio.wait_for(resumed.run(), timeout=2.0)
+
+    assert [message.source for message in result.messages] == ["B"]
+    assert result.stop_reason is not None
+    assert agent_b.total_messages == 1
+
+
+@pytest.mark.asyncio
+async def test_digraph_group_chat_rejects_checkpoint_with_in_flight_successor(
+    runtime: AgentRuntime | None,
+) -> None:
+    """Do not mistake a dequeued, still-running successor for a lost transition."""
+    agent_a = _EchoAgent("A", description="Echo agent A")
+    agent_b = _EchoAgent("B", description="Echo agent B")
+    graph = DiGraph(
+        nodes={
+            "A": DiGraphNode(name="A", edges=[DiGraphEdge(target="B")]),
+            "B": DiGraphNode(name="B", edges=[]),
+        }
+    )
+    team = GraphFlow(participants=[agent_a, agent_b], graph=graph, runtime=runtime)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_on_messages = agent_b.on_messages
+
+    async def blocked_on_messages(
+        messages: Sequence[BaseChatMessage], cancellation_token: CancellationToken
+    ) -> Response:
+        entered.set()
+        await release.wait()
+        return await original_on_messages(messages, cancellation_token)
+
+    with patch.object(agent_b, "on_messages", side_effect=blocked_on_messages):
+        running = asyncio.create_task(team.run(task="Start"))
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        state = dict(await team.save_state())
+        manager_state = state["agent_states"]["GraphManager"]
+        assert manager_state["message_thread"][-1]["source"] == "A"
+        assert manager_state["ready"] == []
+        assert manager_state["in_flight"] == ["B"]
+        release.set()
+        await asyncio.wait_for(running, timeout=2.0)
+
+    resumed = GraphFlow(participants=[agent_a, agent_b], graph=graph, runtime=runtime)
+    with pytest.raises(ValueError, match="agents in flight"):
+        await resumed.load_state(state)
+
+
+@pytest.mark.asyncio
+async def test_digraph_group_chat_rejects_ambiguous_legacy_transition_checkpoint(
+    runtime: AgentRuntime | None,
+) -> None:
+    """Legacy state without in-flight metadata must not replay a possible successor."""
+    agent_a = _EchoAgent("A", description="Echo agent A")
+    agent_b = _EchoAgent("B", description="Echo agent B")
+    graph = DiGraph(
+        nodes={
+            "A": DiGraphNode(name="A", edges=[DiGraphEdge(target="B")]),
+            "B": DiGraphNode(name="B", edges=[]),
+        }
+    )
+    team = GraphFlow(participants=[agent_a, agent_b], graph=graph, runtime=runtime)
+    with patch.object(DiGraphEdge, "check_condition", side_effect=RuntimeError("transition interrupted")):
+        with pytest.raises(RuntimeError, match="transition interrupted"):
+            await asyncio.wait_for(team.run(task="Continue"), timeout=2.0)
+    state = dict(await team.save_state())
+    state["agent_states"] = dict(state["agent_states"])
+    manager_state = dict(state["agent_states"]["GraphManager"])
+    manager_state.pop("in_flight")
+    state["agent_states"]["GraphManager"] = manager_state
+
+    resumed = GraphFlow(participants=[agent_a, agent_b], graph=graph, runtime=runtime)
+    with pytest.raises(ValueError, match="legacy GraphFlow checkpoint"):
+        await resumed.load_state(state)
+
+
+@pytest.mark.asyncio
+async def test_digraph_group_chat_resume_does_not_replay_condition_callback(
+    runtime: AgentRuntime | None,
+) -> None:
+    """Loading a transition-error checkpoint must not execute user code again."""
+    calls = 0
+
+    def condition(message: BaseChatMessage) -> bool:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("condition failed")
+
+    agent_a = _EchoAgent("A", description="Echo agent A")
+    agent_b = _EchoAgent("B", description="Echo agent B")
+    graph = DiGraph(
+        nodes={
+            "A": DiGraphNode(name="A", edges=[DiGraphEdge(target="B", condition=condition)]),
+            "B": DiGraphNode(name="B", edges=[]),
+        }
+    )
+    team = GraphFlow(participants=[agent_a, agent_b], graph=graph, runtime=runtime)
+    with pytest.raises(RuntimeError, match="condition failed"):
+        await asyncio.wait_for(team.run(task="Continue"), timeout=2.0)
+    state = dict(await team.save_state())
+    assert calls == 1
+    assert state["agent_states"]["GraphManager"]["ready"] == []
+
+    resumed = GraphFlow(participants=[agent_a, agent_b], graph=graph, runtime=runtime)
+    await resumed.load_state(state)
+    assert calls == 1
+    # This old checkpoint does not record the callback outcome. Preserve its
+    # state instead of inventing a successful transition or invoking it again.
+    assert await resumed.save_state() == state

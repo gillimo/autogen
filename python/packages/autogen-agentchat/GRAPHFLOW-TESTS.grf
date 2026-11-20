@@ -1,0 +1,24 @@
+```grf:context id="downstream-example"
+{
+  "format": "grf.downstream-preview/v1",
+  "title": "Optional GRF-supervised GraphFlow regression run",
+  "content": "Run from the AutoGen repository root with the public GRF v0.6.1 client configured for your own enrollment. This optional action supervises the existing GraphFlow test command; AutoGen's normal uv/pytest command remains unchanged. The child command's exit code is the test result: a nonzero exit is a failed check and must not be treated as task completion; only exit code 0 means this command passed. GRF admission is not itself a test pass, and GRF does not independently judge test quality. This cooperative process wrapper is not a hostile-code sandbox. No credentials or cloud enrollment are included in this example.",
+  "action": {
+    "argv": [
+      "uv",
+      "run",
+      "--directory",
+      "python",
+      "--package",
+      "autogen-agentchat",
+      "pytest",
+      "-q",
+      "packages/autogen-agentchat/tests/test_group_chat_graph.py"
+    ],
+    "cwd": ".",
+    "scope": "Run the AutoGen AgentChat GraphFlow regression suite; propagate pytest exit status",
+    "identity": "autogen-agentchat-graphflow-tests",
+    "children": "inherit"
+  }
+}
+```

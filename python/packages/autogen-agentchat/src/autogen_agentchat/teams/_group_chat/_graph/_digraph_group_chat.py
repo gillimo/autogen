@@ -362,6 +362,10 @@ class GraphFlowManager(BaseGroupChatManager):
 
         # Ready queue for nodes that are ready to execute, starting with the start nodes.
         self._ready: Deque[str] = deque([n for n in graph.get_start_nodes()])
+        # Speakers removed from _ready but whose response has not yet been
+        # processed. Persist this so a checkpoint taken during execution is
+        # not mistaken for an interrupted predecessor transition.
+        self._in_flight: Set[str] = set()
 
     def _build_lookup_tables(self, graph: DiGraph) -> None:
         """Build activation and enqueued_any lookup tables by collecting all edges and grouping by target node.
@@ -399,6 +403,10 @@ class GraphFlowManager(BaseGroupChatManager):
             return
         assert isinstance(message, BaseChatMessage)
         source = message.source
+        # The speaker's response is now in the message thread. Clear its
+        # in-flight marker before evaluating edges so a failed transition can
+        # be recovered from the persisted predecessor message and counters.
+        self._in_flight.discard(source)
 
         # Propagate the update to the children of the node.
         for edge in self._edges[source]:
@@ -461,6 +469,7 @@ class GraphFlowManager(BaseGroupChatManager):
         while self._ready:
             speaker = self._ready.popleft()
             speakers.append(speaker)
+            self._in_flight.add(speaker)
 
             # Reset the bookkeeping for the specific activation groups that were triggered
             self._reset_triggered_activation_groups(speaker)
@@ -485,7 +494,7 @@ class GraphFlowManager(BaseGroupChatManager):
             True if the conversation should be terminated, False otherwise
         """
         # Check if the graph execution is complete (no ready speakers) - prioritize this check
-        if not self._ready:
+        if not self._ready and not self._in_flight:
             stop_message = StopMessage(
                 content=_DIGRAPH_STOP_MESSAGE,
                 source=self._name,
@@ -508,6 +517,7 @@ class GraphFlowManager(BaseGroupChatManager):
         self._remaining = {target: Counter(groups) for target, groups in self._graph.get_remaining_map().items()}
         self._enqueued_any = {n: {g: False for g in self._enqueued_any[n]} for n in self._enqueued_any}
         self._ready = deque([n for n in self._graph.get_start_nodes()])
+        self._in_flight.clear()
 
     async def save_state(self) -> Mapping[str, Any]:
         """Save the execution state."""
@@ -517,6 +527,7 @@ class GraphFlowManager(BaseGroupChatManager):
             "remaining": {target: dict(counter) for target, counter in self._remaining.items()},
             "enqueued_any": dict(self._enqueued_any),
             "ready": list(self._ready),
+            "in_flight": sorted(self._in_flight),
         }
         return state
 
@@ -527,6 +538,68 @@ class GraphFlowManager(BaseGroupChatManager):
         self._remaining = {target: Counter(groups) for target, groups in state["remaining"].items()}
         self._enqueued_any = state["enqueued_any"]
         self._ready = deque(state["ready"])
+        # Older checkpoints did not record which speaker had already been
+        # dequeued. They cannot safely distinguish an interrupted transition
+        # from a save taken while that successor was running. Fail closed for
+        # this ambiguous shape rather than re-running a possibly in-flight
+        # agent or reporting the graph complete.
+        if "in_flight" not in state and not self._ready and self._message_thread:
+            message = self._message_thread[-1]
+            if isinstance(message, BaseChatMessage) and message.source in self._graph.nodes:
+                for edge in self._edges[message.source]:
+                    if edge.condition_function is not None:
+                        raise ValueError(
+                            "Cannot safely load a legacy GraphFlow checkpoint with a callable edge condition: "
+                            "its outcome was not persisted."
+                        )
+                    if not edge.check_condition(message):
+                        continue
+                    remaining = self._remaining[edge.target][edge.activation_group]
+                    original = self._origin_remaining[edge.target][edge.activation_group]
+                    if (
+                        self._activation[edge.target][edge.activation_group] == "all"
+                        and remaining == original == 1
+                    ):
+                        raise ValueError(
+                            "Cannot safely load a legacy GraphFlow checkpoint with an empty ready queue: "
+                            "it may have been saved while a successor was in flight."
+                        )
+        self._in_flight = set(state.get("in_flight", []))
+        if self._in_flight:
+            raise ValueError(
+                "Cannot safely resume a GraphFlow checkpoint with agents in flight. "
+                "Save the team only after it has stopped or paused at a checkpoint."
+            )
+
+        # An interruption can persist an agent message before its single-parent
+        # all-activation successor is added to the ready queue. Recover only this
+        # unambiguous case; a positive counter alone is not enough because
+        # conditional branches can legitimately remain unreachable.
+        if not self._ready and not self._in_flight and self._message_thread:
+            message = self._message_thread[-1]
+            if isinstance(message, BaseChatMessage) and message.source in self._graph.nodes:
+                # Loading state must not replay arbitrary user callbacks. Their
+                # effects/results cannot be reconstructed safely from old state.
+                matching_edges = [
+                    edge
+                    for edge in self._edges[message.source]
+                    if edge.condition_function is None and edge.check_condition(message)
+                ]
+                edge_counts: Counter[tuple[str, str]] = Counter(
+                    (edge.target, edge.activation_group) for edge in matching_edges
+                )
+                for edge in matching_edges:
+                    key = (edge.target, edge.activation_group)
+                    remaining = self._remaining[edge.target][edge.activation_group]
+                    original = self._origin_remaining[edge.target][edge.activation_group]
+                    if (
+                        self._activation[edge.target][edge.activation_group] == "all"
+                        and edge_counts[key] == 1
+                        and remaining == original == 1
+                    ):
+                        self._remaining[edge.target][edge.activation_group] -= 1
+                        self._ready.append(edge.target)
+                        self._save_triggered_activation_group(edge.target, edge.activation_group)
 
     async def reset(self) -> None:
         """Reset execution state to the start of the graph."""
